@@ -64,7 +64,6 @@ print("\nMaximum values:\n", num_vars.max())
 print("\nQuantiles (0.25):\n", num_vars.quantile(q=0.25))
 
 
-
 # %%
 # We can also calculate statistics for individual columns
 
@@ -100,13 +99,51 @@ num_vars.hist(figsize=(12, 10), bins=20)
 plt.suptitle("Distributions of numeric variables")
 plt.show()
 
-# %% 
+# %%
 # Boxplot for LTV_orig_time
+sns.boxplot(x=data["balance_time"])
+plt.title("Boxplot of balance_time")
+plt.show()
 
 sns.boxplot(x=data["LTV_orig_time"])
 plt.title("Boxplot of LTV_orig_time")
 plt.show()
 
+sns.boxplot(x=data["LTV_time"])
+plt.title("Boxplot of LTV_time")
+plt.show()
+
+sns.boxplot(x=data["interest_rate_time"])
+plt.title("Boxplot of interest_rate_time")
+plt.show()
+
+sns.boxplot(x=data["hpi_time"])
+plt.title("Boxplot of hpi_time")
+plt.show()
+
+sns.boxplot(x=data["gdp_time"])
+plt.title("Boxplot of gdp_time")
+plt.show()
+
+sns.boxplot(x=data["balance_orig_time"])
+plt.title("Boxplot of balance_orig_time")
+plt.show()
+
+sns.boxplot(x=data["FICO_orig_time"])
+plt.title("Boxplot of FICO_orig_time")
+plt.show()
+
+sns.boxplot(x=data["Interest_Rate_orig_time"])
+plt.title("Boxplot of Interest_Rate_orig_time")
+plt.show()
+
+sns.boxplot(x=data["hpi_orig_time"])
+plt.title("Boxplot of hpi_orig_time")
+plt.show()
+
+sns.boxplot(x=data["uer_time"])
+plt.title("Boxplot of uer_time")
+plt.show()
 # %%
 # Correlation
 
@@ -123,7 +160,8 @@ plt.show()
 # Data aggregation
 
 # Group by home type and calculate average FICO score in each type
-home_type_fico_mean = data.groupby(["REtype_SF_orig_time"])["FICO_orig_time"].mean()
+home_type_fico_mean = data.groupby(["REtype_SF_orig_time"])[
+    "FICO_orig_time"].mean()
 print(home_type_fico_mean)
 
 # %%
@@ -147,7 +185,7 @@ print(data_mean_imputed.isnull().sum())
 data_dropped = data.dropna()
 print(data_dropped.isnull().sum())
 
-#Q: Other thoughts how to handle missing data?
+# Q: Other thoughts how to handle missing data?
 
 # %%
 # Simple function for variable modification
@@ -169,7 +207,7 @@ FICO_class_counts = data.groupby(["FICO_class"])["FICO_class"].count()
 print(FICO_class_counts)
 
 
-# %% 
+# %%
 # Boxplot for outliers for FICO_class
 sns.boxplot(x="FICO_class", y="LTV_orig_time", data=data)
 plt.title("LTV by FICO class")
