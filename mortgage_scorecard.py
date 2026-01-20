@@ -3,10 +3,11 @@
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
-from optbinning import OptimalBinning, BinningProcess
+from optbinning import BinningProcess
 from sklearn import metrics
 import matplotlib.pyplot as plt
-
+import seaborn as sns
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 # %% 1. Data Import
 data = pd.read_csv("mortgage_sample.csv")
@@ -20,16 +21,16 @@ data = pd.read_csv("mortgage_sample.csv")
 
 data["max_time_per_loan"] = data.groupby("id")["time"].transform("max")
 data["orig_time_per_loan"] = data.groupby("id")["orig_time"].transform("first")
+data["age"] = data.groupby("id").cumcount() + 1
 data["max_age"] = data.groupby("id")["age"].transform("max")
 
-data_cohort = data
-data_cohort["age"] = data_cohort.groupby("id").cumcount() + 1
+data = data
 
 
-data_cohort = data_cohort[(data_cohort["max_age"] >= 12)]
+data = data[(data["max_age"] >= 12)]
 
 # TODO: Need to add split into train and test!
-sample = data_cohort[(data_cohort["sample"] == "public")]
+sample = data[(data["sample"] == "public")]
 
 loan_recency = (
     sample.groupby("id")["time"]
@@ -45,8 +46,8 @@ index = int(0.8 * len(loan_recency))
 train_ids = loan_recency.iloc[:index]["id"]
 test_ids = loan_recency.iloc[index:]["id"]
 
-train = data_cohort[data_cohort["id"].isin(train_ids)]
-test = data_cohort[data_cohort["id"].isin(test_ids)]
+train = data[data["id"].isin(train_ids)]
+test = data[data["id"].isin(test_ids)]
 
 default_date = train[train["default_time"] == 1].groupby("id")["time"].min()
 
@@ -70,15 +71,11 @@ def compute_target_correct(row, df_defaults):
 train["TARGET"] = train.apply(compute_target_correct, args=(default_date,), axis=1)
 test["TARGET"] = test.apply(compute_target_correct, args=(default_date,), axis=1)
 
-test.to_csv("mortgage_test.csv", index=False)
-train.to_csv("mortgage_train.csv", index=False)
-
 # %% 3
 # training_set = sample
 
 # TODO: Exploratory data analysis & treatment of missings + outliers
 
-# print("missing values in test set:", test.isnull().sum())
 print("number clients in training before", train["id"].nunique())
 print("missing values in training set before:", train.isnull().sum())
 
@@ -89,45 +86,78 @@ test_remove_ids = test[test["LTV_time"].isnull()]["id"].unique()
 train = train[~train["id"].isin(train_remove_ids)]
 test = test[~test["id"].isin(test_remove_ids)]
 
-# sample = sample.dropna(
-#    subset=["LTV_orig_time", "FICO_orig_time", "LTV_time", "default_time", "TARGET"]
-# )
+sample = train.copy()
 # %% 3. Predictor preparation
 
 
-# %% Example OptimalBinning for one predictor
-predictor = "LTV_orig_time"
-x = sample[predictor]
-y = sample["TARGET"]
-
-optb = OptimalBinning(name=predictor)
-optb.fit(x, y)
-optb.binning_table.build()
-# %%
-optb.binning_table.analysis()
-
 # %%
 # TODO: All available should be explored to maximize model predictive power
-predictors = ["FICO_orig_time", "LTV_time"]
+cols_to_drop = [
+    "id",
+    "time",
+    "TARGET",
+    "default_time",
+    "payoff_time",
+    "status_time",
+    "sample",
+    "max_time_per_loan",
+    "max_age",
+]
+
+predictors = [col for col in train.columns if col not in cols_to_drop]
 binning_process = BinningProcess(
     variable_names=predictors,
-    binning_fit_params={"LTV_time": {"special_codes": [92.75]}},
+    selection_criteria={"iv": {"min": 0.02}},
+    binning_fit_params={var: {"solver": "mip"} for var in predictors},
 )
 
-X = sample[predictors]
-y = sample["default_time"]
+X = train[predictors]
+y_train = train["TARGET"]
+y_test = test["TARGET"]
+test_ids = test["id"]
+train_ids = train["id"]
 
-binning_process.fit_transform(X, y)
+binning_process.fit(X, y_train)
 binning_process.summary()
+
+train = binning_process.transform(train[predictors], metric="woe")
+test = binning_process.transform(test[predictors], metric="woe")
+
+train["TARGET"] = y_train
+test["TARGET"] = y_test
+
+test.to_csv("mortgage_test_woe.csv", index=False)
+train.to_csv("mortgage_train_woe.csv", index=False)
 
 # TODO: Multivariate (correlation) check
 
+# remove hpi_origin_time due to high correlation with orig_time_per_loan
+train = train.drop(columns=["hpi_orig_time", "orig_time"])
+test = test.drop(columns=["hpi_orig_time", "orig_time"])
+
+corr_matrix = train.corr()
+fig, ax = plt.subplots(figsize=(8, 6))
+sns.heatmap(corr_matrix, cmap="coolwarm", annot=False)
+ax.set_title("Correlation Matrix Heatmap")
+plt.show()
+
+# Calculation VIF
+vif_data = pd.DataFrame()
+vif_data["Variable"] = train.columns
+vif_data["VIF"] = [
+    variance_inflation_factor(train.values, i) for i in range(train.shape[1])
+]
+
+print(vif_data.sort_values("VIF", ascending=False))
+
 # %% 4. Modelling
 # TODO: Think carefully about predictors we want to add
+vars_to_remove = ["TARGET"]
+X = train.drop(columns=vars_to_remove, errors="ignore")
 X = sm.add_constant(X)
 
 # %% Simple regression estimation
-logit_mod = sm.Logit(endog=y, exog=X)
+logit_mod = sm.Logit(endog=y_train, exog=X)
 estimated_model = logit_mod.fit(disp=0)
 estimated_model.summary()
 
