@@ -2,11 +2,10 @@
 # imports
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupKFold
 import statsmodels.api as sm
 from optbinning import BinningProcess
-from sklearn import metrics
+from sklearn import metrics, set_config
 import matplotlib.pyplot as plt
 import seaborn as sns
 from statsmodels.stats.outliers_influence import variance_inflation_factor
@@ -15,6 +14,8 @@ from sklearn.metrics import confusion_matrix
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegressionCV
+
+set_config(enable_metadata_routing=True)
 
 
 # %% 1. Data Import
@@ -31,7 +32,7 @@ data = pd.read_csv("mortgage_sample.csv")
 data["max_time_per_loan"] = data.groupby("id")["time"].transform("max")
 data["orig_time_per_loan"] = data.groupby("id")["orig_time"].transform("first")
 data["age"] = data["time"] - data["orig_time"]
-data = data[data["orig_time"] == 25]
+data = data[data["orig_time"].isin([25, 26])]
 
 data.to_csv("mortgage_full_sample.csv", index=False)
 
@@ -69,11 +70,9 @@ def compute_target_robust(row):
 data["TARGET"] = data.apply(compute_target_robust, axis=1)
 data_model = data.dropna(subset=["TARGET"]).copy()
 
-unique_ids = data["id"].unique()
-train_ids, test_ids = train_test_split(unique_ids, test_size=0.2, random_state=42)
 
-train = data[data["id"].isin(train_ids)]
-test = data[data["id"].isin(test_ids)]
+train = data_model[data_model["orig_time"] == 25]
+test = data_model[data_model["orig_time"] == 26]
 
 # %% 3
 # training_set = sample
@@ -290,26 +289,33 @@ train_woe.to_csv("mortgage_train_woe.csv", index=False)
 
 # TODO: Multivariate (correlation) check
 
+train_woe = train_woe.loc[:, train_woe.std() > 0]
+test_woe = test_woe[train_woe.columns]
+
+
 # remove hpi_origin_time due to high correlation with orig_time_per_loan
-to_remove = [
-    "orig_time_per_loan",
-    "orig_time",
-    "LTV_time",
-    "balance_time",
-    "gdp_time",
-    "stress_index",
-    "LTV_roll_mean_3m",
-    "hpi_ratio",
-    "hpi_ratio_sq",
-    "interest_rate_time_sq",
-    "uer_time_sq",
-    "bal_roll_mean_3m",
-    "age",
-]
+def calculate_vif(df):
+    vif = pd.DataFrame()
+    vif["Variable"] = df.columns
+    vif["VIF"] = [variance_inflation_factor(df.values, i) for i in range(df.shape[1])]
+    return vif
 
 
-train_woe = train_woe.drop(columns=to_remove, errors="ignore")
-test_woe = test_woe.drop(columns=to_remove, errors="ignore")
+def drop_high_vif(df, threshold):
+    df = df.copy()
+    while True:
+        vif = calculate_vif(df)
+        max_vif = vif["VIF"].max()
+        if max_vif <= threshold:
+            break
+        var_to_drop = vif.sort_values("VIF", ascending=False).iloc[0]["Variable"]
+        print(f"Dropping {var_to_drop} (VIF={max_vif:.2f})")
+        df = df.drop(columns=var_to_drop)
+    return df
+
+
+train_woe = drop_high_vif(train_woe, threshold=10)
+test_woe = test_woe[train_woe.columns]
 
 corr_matrix = train_woe.corr()
 fig, ax = plt.subplots(figsize=(8, 6))
@@ -317,14 +323,8 @@ sns.heatmap(corr_matrix, cmap="coolwarm", annot=False)
 ax.set_title("Correlation Matrix Heatmap")
 plt.show()
 
-# Calculation VIF
-vif_data = pd.DataFrame()
-vif_data["Variable"] = train_woe.columns
-vif_data["VIF"] = [
-    variance_inflation_factor(train_woe.values, i) for i in range(train_woe.shape[1])
-]
 
-print(vif_data.sort_values("VIF", ascending=False))
+print(calculate_vif(train_woe).sort_values("VIF", ascending=False))
 
 
 # %% 4. Modelling
@@ -336,7 +336,9 @@ test_woe = sm.add_constant(test_woe, has_constant="add")
 
 # %% Simple regression estimation
 logit_mod = sm.Logit(endog=y_train, exog=X)
-estimated_model_full = logit_mod.fit(disp=0)
+estimated_model_full = logit_mod.fit(
+    disp=0, cov_type="cluster", cov_kwds={"groups": train["id"]}
+)
 y_pred = estimated_model_full.predict(test_woe)
 
 estimated_model_full.summary()
@@ -345,6 +347,7 @@ benchmark = pd.DataFrame(
     columns=[
         "Model name",
         "GINI",
+        "Gini by id",
         "Pseudo R2",
         "Sensitivity",
         "Specificity",
@@ -372,7 +375,9 @@ while True:
     for key in not_selected:
         # estimate model
         logit_mod = sm.Logit(endog=y_train, exog=X[selected + [key]])
-        estimated_model = logit_mod.fit(disp=0)
+        estimated_model = logit_mod.fit(
+            disp=0, cov_type="cluster", cov_kwds={"groups": train["id"]}
+        )
 
         # extract p_value
         p_values[key] = estimated_model.pvalues[key]
@@ -403,7 +408,9 @@ while True:
 
 # TODO: Make sure to create several candidate models to compare
 logit_mod = sm.Logit(endog=y_train, exog=X[selected])
-estimated_model_step_regression = logit_mod.fit(disp=0)
+estimated_model_step_regression = logit_mod.fit(
+    disp=0, cov_type="cluster", cov_kwds={"groups": train["id"]}
+)
 y_pred_step_regre = estimated_model_step_regression.predict(test_woe[selected])
 
 # TODO: Check the final model quality - p-values? Coefficient signs?
@@ -428,30 +435,54 @@ plt.plot(fpr, tpr, label="GINI=" + str(2 * auc_full - 1))
 plt.legend(loc=4)
 plt.show()
 
+
+pred_by_id = pd.DataFrame({"id": test["id"], "y": y_test, "p": y_pred})
+agg = pred_by_id.groupby("id").agg(y=("y", "max"), p=("p", "max")).reset_index()
+
+auc_id = metrics.roc_auc_score(agg["y"], agg["p"])
+gini_id_full = 2 * auc_id - 1
+
+
+pred_by_id_st = pd.DataFrame({"id": test["id"], "y": y_test, "p": y_pred_step_regre})
+agg = pred_by_id_st.groupby("id").agg(y=("y", "max"), p=("p", "max")).reset_index()
+
+auc_id = metrics.roc_auc_score(agg["y"], agg["p"])
+gini_id_step_regre = 2 * auc_id - 1
+
 y_pred_const_step_regression = (y_pred_step_regre >= best_threshold).astype(int)
-tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const_step_regression).ravel()
+tn_s, fp_s, fn_s, tp_s = confusion_matrix(y_test, y_pred_const_step_regression).ravel()
 
 y_pred_const_full = (y_pred >= best_threshold_full).astype(int)
-tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const_full).ravel()
+tn_f, fp_f, fn_f, tp_f = confusion_matrix(y_test, y_pred_const_full).ravel()
 
 benchmark.loc[len(benchmark)] = {
     "Model name": "Logitistic Regression Full",
     "GINI": 2 * auc_full - 1,
+    "Gini by id": gini_id_full,
     "Pseudo R2": estimated_model_full.prsquared,
-    "Sensitivity": tp / (tp + fn) if (tp + fn) > 0 else np.nan,
-    "Specificity": tn / (tn + fp) if (tn + fp) > 0 else np.nan,
-    "Accuracy": (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan,
-    "Precision": tp / (tp + fp) if (tp + fp) > 0 else np.nan,
+    "Sensitivity": tp_f / (tp_f + fn_f) if (tp_f + fn_f) > 0 else np.nan,
+    "Specificity": tn_f / (tn_f + fp_f) if (tn_f + fp_f) > 0 else np.nan,
+    "Accuracy": (
+        (tp_f + tn_f) / (tp_f + tn_f + fp_f + fn_f)
+        if (tp_f + tn_f + fp_f + fn_f) > 0
+        else np.nan
+    ),
+    "Precision": tp_f / (tp_f + fp_f) if (tp_f + fp_f) > 0 else np.nan,
 }
 
 benchmark.loc[len(benchmark)] = {
     "Model name": "Logitistic Regression stepwise",
     "GINI": 2 * auc - 1,
+    "Gini by id": gini_id_step_regre,
     "Pseudo R2": estimated_model_step_regression.prsquared,
-    "Sensitivity": tp / (tp + fn) if (tp + fn) > 0 else np.nan,
-    "Specificity": tn / (tn + fp) if (tn + fp) > 0 else np.nan,
-    "Accuracy": (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan,
-    "Precision": tp / (tp + fp) if (tp + fp) > 0 else np.nan,
+    "Sensitivity": tp_s / (tp_s + fn_s) if (tp_s + fn_s) > 0 else np.nan,
+    "Specificity": tn_s / (tn_s + fp_s) if (tn_s + fp_s) > 0 else np.nan,
+    "Accuracy": (
+        (tp_s + tn_s) / (tp_s + tn_s + fp_s + fn_s)
+        if (tp_s + tn_s + fp_s + fn_s) > 0
+        else np.nan
+    ),
+    "Precision": tp_s / (tp_s + fp_s) if (tp_s + fp_s) > 0 else np.nan,
 }
 
 # TODO: Other model assessment dimensions
@@ -463,9 +494,10 @@ if "const" in X.columns:
 if "const" in test_woe.columns:
     test_woe = test_woe.drop(columns="const")
 
+group_kfold = GroupKFold(n_splits=10)
 lasso_model = LogisticRegressionCV(
     Cs=20,
-    cv=10,
+    cv=group_kfold,
     penalty="l1",
     solver="liblinear",
     scoring="roc_auc",
@@ -473,7 +505,7 @@ lasso_model = LogisticRegressionCV(
     max_iter=1000,
 )
 
-lasso_model.fit(X, y_train)
+lasso_model.fit(X, y_train, groups=train["id"])
 y_pred_lasso = lasso_model.predict_proba(test_woe)[:, 1]
 
 
@@ -491,6 +523,12 @@ fpr, tpr, thresholds_lasso = metrics.roc_curve(y_test, y_pred_lasso)
 auc = metrics.roc_auc_score(y_test, y_pred_lasso)
 gini = 2 * auc - 1
 
+pred_by_id = pd.DataFrame({"id": test["id"], "y": y_test, "p": y_pred_lasso})
+agg = pred_by_id.groupby("id").agg(y=("y", "max"), p=("p", "max")).reset_index()
+
+auc_id = metrics.roc_auc_score(agg["y"], agg["p"])
+gini_id_lasso = 2 * auc_id - 1
+
 best_idx_lasso = np.argmax(tpr - fpr)
 best_threshold_lasso = thresholds_lasso[best_idx_lasso]
 
@@ -499,6 +537,7 @@ tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const_lasso).ravel()
 benchmark.loc[len(benchmark)] = {
     "Model name": "Logitistic Regression Lasso",
     "GINI": 2 * auc - 1,
+    "Gini by id": gini_id_lasso,
     "Pseudo R2": pseudo_r2,
     "Sensitivity": tp / (tp + fn) if (tp + fn) > 0 else np.nan,
     "Specificity": tn / (tn + fp) if (tn + fp) > 0 else np.nan,
@@ -513,17 +552,19 @@ if "const" in X.columns:
 if "const" in test_woe.columns:
     test_woe = test_woe.drop(columns="const")
 
+group_kfold = GroupKFold(n_splits=10)
+
 elastic_net_cv = LogisticRegressionCV(
     Cs=10,
     l1_ratios=[0.1, 0.5, 0.7, 0.9],  # Teste aussi différentes combinaisons L1/L2
-    cv=10,
+    cv=group_kfold,
     penalty="elasticnet",
     solver="saga",
     scoring="roc_auc",
     random_state=42,
     max_iter=2000,
 )
-elastic_net_cv.fit(X, y_train)
+elastic_net_cv.fit(X, y_train, groups=train["id"])
 y_pred_elas_net = elastic_net_cv.predict_proba(test_woe)[:, 1]
 
 # calculate prsquare
@@ -541,6 +582,11 @@ fpr, tpr, thresholds_elas_net = metrics.roc_curve(y_test, y_pred_elas_net)
 auc = metrics.roc_auc_score(y_test, y_pred_elas_net)
 gini = 2 * auc - 1
 
+pred_by_id = pd.DataFrame({"id": test["id"], "y": y_test, "p": y_pred_elas_net})
+agg = pred_by_id.groupby("id").agg(y=("y", "max"), p=("p", "max")).reset_index()
+auc_id = metrics.roc_auc_score(agg["y"], agg["p"])
+gini_id_elas_net = 2 * auc_id - 1
+
 best_idx_elas_net = np.argmax(tpr - fpr)
 best_threshold_elas_net = thresholds_elas_net[best_idx_elas_net]
 
@@ -549,6 +595,7 @@ tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const_elas_net).ravel()
 benchmark.loc[len(benchmark)] = {
     "Model name": "Logitistic Regression Elastic Net",
     "GINI": 2 * auc - 1,
+    "Gini by id": gini_id_elas_net,
     "Pseudo R2": pseudo_r2,
     "Sensitivity": tp / (tp + fn) if (tp + fn) > 0 else np.nan,
     "Specificity": tn / (tn + fp) if (tn + fp) > 0 else np.nan,
