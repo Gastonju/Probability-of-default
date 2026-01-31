@@ -28,7 +28,6 @@ data = pd.read_csv("mortgage_sample.csv")
 data["max_time_per_loan"] = data.groupby("id")["time"].transform("max")
 data["orig_time_per_loan"] = data.groupby("id")["orig_time"].transform("first")
 data["age"] = data["time"] - data["orig_time"]
-data["max_age"] = data.groupby("id")["age"].transform("max")
 data = data[data["orig_time"] == 25]
 
 data.to_csv("mortgage_full_sample.csv", index=False)
@@ -47,19 +46,19 @@ data = data.merge(loan_end, on="id", how="left")
 
 def compute_target_robust(row):
     horizon = row["time"] + 12
-    # Si le prêt finit par un défaut
+
     if row["final_status"] == 1:
-        # Et que le défaut est dans l'horizon -> 1
+
         if row["end_time"] <= horizon:
             return 1
         else:
             return 0
-    # Si le prêt est remboursé (2) ou actif (0)
+
     else:
-        # Si on a observé le prêt jusqu'à l'horizon -> 0 (Sûr)
+
         if row["end_time"] >= horizon:
             return 0
-        # Sinon -> NaN (On ne sait pas, on exclut)
+        # we don't know
         else:
             return np.nan
 
@@ -79,11 +78,16 @@ test = data[data["id"].isin(test_ids)]
 # TODO: Exploratory data analysis & treatment of missings + outliers
 
 # remove missing value in the training set
-train_remove_ids = train[train["LTV_time"].isnull()]["id"].unique()
-test_remove_ids = test[test["LTV_time"].isnull()]["id"].unique()
 
-train = train[~train["id"].isin(train_remove_ids)].copy()
-test = test[~test["id"].isin(test_remove_ids)].copy()
+train = train.copy()
+test = test.copy()
+
+numeric_cols = train.select_dtypes(include=["number"]).columns
+
+for i in numeric_cols:
+    median = train[i].median()
+    train[i] = train[i].fillna(median)
+    test[i] = test[i].fillna(median)
 
 sample = train.copy()
 
@@ -141,41 +145,11 @@ for df in (train, test):
 client_features = (
     train.groupby("id")
     .agg(
-        LTV_mean=("LTV_time", "mean"),
-        LTV_max=("LTV_time", "max"),
-        gdp_mean=("gdp_time", "mean"),
-        gdp_max=("gdp_time", "max"),
-        balance_mean=("balance_time", "mean"),
-        balance_max=("balance_time", "max"),
-        uer_mean=("uer_time", "mean"),
-        interest_rate_mean=("interest_rate_time", "mean"),
-        hpi_ratio_mean=("hpi_ratio", "mean"),
-        stress_index_mean=("stress_index", "mean"),
-        interest_burden_mean=("interest_burden", "mean"),
-        gdp_d_max=("d_gdp_1m", "max"),
-        LTV_std=("LTV_time", "std"),
-        balance_std=("balance_time", "std"),
-        stress_index_std=("stress_index", "std"),
-        gdp_std=("gdp_time", "std"),
-        LTV_last=("LTV_time", "last"),
-        balance_last=("balance_time", "last"),
-        uer_last=("uer_time", "last"),
-        rate_last=("interest_rate_time", "last"),
-        hpi_ratio_last=("hpi_ratio", "last"),
-        LTV_recent_mean_3m=("LTV_roll_mean_3m", "last"),
-        LTV_recent_std_6m=("LTV_roll_std_6m", "last"),
-        bal_recent_mean_3m=("bal_roll_mean_3m", "last"),
-        bal_recent_std_6m=("bal_roll_std_6m", "last"),
-        stress_recent_mean_3m=("stress_roll_mean_3m", "last"),
-        stress_recent_std_6m=("stress_roll_std_6m", "last"),
-        gdp_recent_mean_3m=("gdp_roll_mean_3m", "last"),
-        gdp_recent_std_6m=("gdp_roll_std_6m", "last"),
-        d_LTV_mean=("d_LTV_1m", "mean"),
-        d_bal_mean=("d_bal_1m", "mean"),
-        d_rate_mean=("d_rate_1m", "mean"),
-        d_uer_mean=("d_uer_1m", "mean"),
-        d_hpi_ratio_mean=("d_hpi_ratio_1m", "mean"),
-        d_gdp_mean=("d_gdp_1m", "mean"),
+        LTV_orig_time=("LTV_orig_time", "first"),
+        FICO_orig_time=("FICO_orig_time", "first"),
+        balance_orig_time=("balance_orig_time", "first"),
+        Interest_Rate_orig_time=("Interest_Rate_orig_time", "first"),
+        investor_orig_time=("investor_orig_time", "first"),
     )
     .reset_index()
 )
@@ -183,76 +157,22 @@ client_features = (
 client_features_test = (
     test.groupby("id")
     .agg(
-        LTV_mean=("LTV_time", "mean"),
-        LTV_max=("LTV_time", "max"),
-        gdp_mean=("gdp_time", "mean"),
-        gdp_max=("gdp_time", "max"),
-        balance_mean=("balance_time", "mean"),
-        balance_max=("balance_time", "max"),
-        uer_mean=("uer_time", "mean"),
-        interest_rate_mean=("interest_rate_time", "mean"),
-        hpi_ratio_mean=("hpi_ratio", "mean"),
-        stress_index_mean=("stress_index", "mean"),
-        interest_burden_mean=("interest_burden", "mean"),
-        gdp_d_max=("d_gdp_1m", "max"),
-        LTV_std=("LTV_time", "std"),
-        balance_std=("balance_time", "std"),
-        stress_index_std=("stress_index", "std"),
-        gdp_std=("gdp_time", "std"),
-        LTV_last=("LTV_time", "last"),
-        balance_last=("balance_time", "last"),
-        uer_last=("uer_time", "last"),
-        rate_last=("interest_rate_time", "last"),
-        hpi_ratio_last=("hpi_ratio", "last"),
-        LTV_recent_mean_3m=("LTV_roll_mean_3m", "last"),
-        LTV_recent_std_6m=("LTV_roll_std_6m", "last"),
-        bal_recent_mean_3m=("bal_roll_mean_3m", "last"),
-        bal_recent_std_6m=("bal_roll_std_6m", "last"),
-        stress_recent_mean_3m=("stress_roll_mean_3m", "last"),
-        stress_recent_std_6m=("stress_roll_std_6m", "last"),
-        gdp_recent_mean_3m=("gdp_roll_mean_3m", "last"),
-        gdp_recent_std_6m=("gdp_roll_std_6m", "last"),
-        d_LTV_mean=("d_LTV_1m", "mean"),
-        d_bal_mean=("d_bal_1m", "mean"),
-        d_rate_mean=("d_rate_1m", "mean"),
-        d_uer_mean=("d_uer_1m", "mean"),
-        d_hpi_ratio_mean=("d_hpi_ratio_1m", "mean"),
-        d_gdp_mean=("d_gdp_1m", "mean"),
+        LTV_orig_time=("LTV_orig_time", "first"),
+        FICO_orig_time=("FICO_orig_time", "first"),
+        balance_orig_time=("balance_orig_time", "first"),
+        Interest_Rate_orig_time=("Interest_Rate_orig_time", "first"),
+        investor_orig_time=("investor_orig_time", "first"),
     )
     .reset_index()
 )
 
 # which variables to use for clustering
 cluster_vars = [
-    "LTV_mean",
-    "LTV_max",
-    "LTV_std",
-    "LTV_last",
-    "balance_mean",
-    "balance_max",
-    "balance_std",
-    "balance_last",
-    "uer_mean",
-    "uer_last",
-    "interest_rate_mean",
-    "rate_last",
-    "hpi_ratio_mean",
-    "hpi_ratio_last",
-    "stress_index_mean",
-    "stress_index_std",
-    "interest_burden_mean",
-    "LTV_recent_mean_3m",
-    "LTV_recent_std_6m",
-    "stress_recent_mean_3m",
-    "stress_recent_std_6m",
-    "d_LTV_mean",
-    "d_bal_mean",
-    "d_rate_mean",
-    "d_uer_mean",
-    "d_hpi_ratio_mean",
-    "d_gdp_mean",
-    "gdp_d_max",
-    "gdp_mean",
+    "LTV_orig_time",
+    "FICO_orig_time",
+    "balance_orig_time",
+    "Interest_Rate_orig_time",
+    "investor_orig_time",
 ]
 
 # Handle NaNs (std/diff/rolling may create NaNs)
@@ -313,7 +233,8 @@ cols_to_drop = [
     "status_time",
     "sample",
     "max_time_per_loan",
-    "max_age",
+    "end_time",
+    "final_status",
 ]
 
 
@@ -355,6 +276,8 @@ to_remove = [
     "LTV_roll_mean_3m",
     "hpi_ratio",
 ]
+
+
 train_woe = train_woe.drop(columns=to_remove, errors="ignore")
 test_woe = test_woe.drop(columns=to_remove, errors="ignore")
 
@@ -438,7 +361,7 @@ while True:
 logit_mod = sm.Logit(endog=y_train, exog=X[selected])
 estimated_model = logit_mod.fit(disp=0)
 y_pred = estimated_model.predict(test_woe[selected])
-threshold = np.quantile(y_pred, 0.70)
+threshold = np.quantile(y_pred, 0.50)
 
 
 # TODO: Check the final model quality - p-values? Coefficient signs?
@@ -457,7 +380,7 @@ plt.show()
 
 # TODO: Other model assessment dimensions
 
-y_pred_const = (y_pred >= 0.1).astype(int)
+y_pred_const = (y_pred >= threshold).astype(int)
 tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const).ravel()
 
 benchmark = pd.DataFrame(
