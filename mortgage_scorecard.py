@@ -14,6 +14,8 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import confusion_matrix
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegressionCV
+
 
 # %% 1. Data Import
 data = pd.read_csv("mortgage_sample.csv")
@@ -114,7 +116,7 @@ for df in (train, test):
     df["hpi_lag3"] = df["hpi_lag3"].fillna(df["hpi_time"])
     df["uer_lag6"] = df["uer_lag6"].fillna(df["uer_time"])
 
-# integration non-linear
+# integration quadratic, features
 for df in (train, test):
     df["LTV_time_sq"] = df["LTV_time"] ** 2
     df["balance_time_sq"] = df["balance_time"] ** 2
@@ -122,6 +124,7 @@ for df in (train, test):
     df["uer_time_sq"] = df["uer_time"] ** 2
     df["hpi_ratio_sq"] = df["hpi_ratio"] ** 2
     df["gdp_time_sq"] = df["gdp_time"] ** 2
+    df["stress_index_sq"] = df["stress_index"] ** 2
 
 
 # variation (trend) features
@@ -413,6 +416,8 @@ fpr, tpr, _ = metrics.roc_curve(y_test, y_pred_step_regre)
 
 auc = metrics.roc_auc_score(y_test, y_pred_step_regre)
 
+auc_full = metrics.roc_auc_score(y_test, y_pred)
+
 plt.plot(fpr, tpr, label="GINI=" + str(2 * auc - 1))
 plt.legend(loc=4)
 plt.show()
@@ -425,7 +430,7 @@ tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const_full).ravel()
 
 benchmark.loc[len(benchmark)] = {
     "Model name": "Logitistic Regression Full",
-    "GINI": 2 * auc - 1,
+    "GINI": 2 * auc_full - 1,
     "Pseudo R2": estimated_model_full.prsquared,
     "Sensitivity": tp / (tp + fn) if (tp + fn) > 0 else np.nan,
     "Specificity": tn / (tn + fp) if (tn + fp) > 0 else np.nan,
@@ -452,11 +457,19 @@ if "const" in X.columns:
 if "const" in test_woe.columns:
     test_woe = test_woe.drop(columns="const")
 
-lasso_model = LogisticRegression(
-    penalty="l1", solver="liblinear", C=0.01, random_state=42
+lasso_model = LogisticRegressionCV(
+    Cs=20,
+    cv=10,
+    penalty="l1",
+    solver="liblinear",
+    scoring="roc_auc",
+    random_state=42,
+    max_iter=1000,
 )
+
 lasso_model.fit(X, y_train)
 y_pred_lasso = lasso_model.predict_proba(test_woe)[:, 1]
+
 
 # calculate prsquare
 ll_model = np.sum(
@@ -491,15 +504,18 @@ if "const" in X.columns:
 if "const" in test_woe.columns:
     test_woe = test_woe.drop(columns="const")
 
-lasso_model = LogisticRegression(
+elastic_net_cv = LogisticRegressionCV(
+    Cs=10,
+    l1_ratios=[0.1, 0.5, 0.7, 0.9],  # Teste aussi différentes combinaisons L1/L2
+    cv=10,
     penalty="elasticnet",
     solver="saga",
-    l1_ratio=0.5,
-    C=0.01,
+    scoring="roc_auc",
     random_state=42,
+    max_iter=2000,
 )
-lasso_model.fit(X, y_train)
-y_pred_elas_net = lasso_model.predict_proba(test_woe)[:, 1]
+elastic_net_cv.fit(X, y_train)
+y_pred_elas_net = elastic_net_cv.predict_proba(test_woe)[:, 1]
 
 # calculate prsquare
 ll_model = np.sum(
@@ -511,7 +527,7 @@ p_null = np.mean(y_test)
 ll_null = np.sum(y_test * np.log(p_null) + (1 - y_test) * np.log(1 - p_null))
 pseudo_r2 = 1 - ll_model / ll_null
 
-
+# calculate GINI
 fpr, tpr, _ = metrics.roc_curve(y_test, y_pred_elas_net)
 auc = metrics.roc_auc_score(y_test, y_pred_elas_net)
 gini = 2 * auc - 1
