@@ -1,15 +1,41 @@
 # %% 0. Settings
 # imports
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn import metrics
+from optbinning import BinningProcess
+import inspect
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
-from optbinning import BinningProcess
-from sklearn import metrics
-import matplotlib.pyplot as plt
-import seaborn as sns
-from statsmodels.stats.outliers_influence import variance_inflation_factor
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
+
+# Compatibility patch: scikit-learn >= 1.6 renamed force_all_finite -> ensure_all_finite
+
+
+def _patch_optbinning_sklearn_compat() -> None:
+    try:
+        from sklearn.utils.validation import check_array as _sk_check_array
+        import optbinning.binning.metrics as _ob_metrics
+    except Exception:
+        return
+
+    sig = inspect.signature(_sk_check_array)
+    has_force = "force_all_finite" in sig.parameters
+    has_ensure = "ensure_all_finite" in sig.parameters
+
+    if (not has_force) and has_ensure:
+        def _check_array_compat(*args, **kwargs):
+            if "force_all_finite" in kwargs and "ensure_all_finite" not in kwargs:
+                kwargs["ensure_all_finite"] = kwargs.pop("force_all_finite")
+            return _sk_check_array(*args, **kwargs)
+
+        _ob_metrics.check_array = _check_array_compat
+
+
+_patch_optbinning_sklearn_compat()
 
 
 # %% 1. Data Import
@@ -37,7 +63,8 @@ data = data[(data["max_age"] >= 12)]
 data = data[(data["sample"] == "public")]
 
 loan_recency = (
-    data.groupby("id")["time"].max().reset_index().rename(columns={"time": "last_time"})
+    data.groupby("id")["time"].max().reset_index().rename(
+        columns={"time": "last_time"})
 )
 
 loan_recency = loan_recency.sort_values("last_time")
@@ -50,7 +77,12 @@ test_ids = loan_recency.iloc[index:]["id"]
 train = data[data["id"].isin(train_ids)]
 test = data[data["id"].isin(test_ids)]
 
-default_date = data[data["default_time"] == 1].groupby("id")["time"].min()
+default_date = (
+    data.loc[data["default_time"] == 1]
+    .groupby("id")["time"]
+    .min()
+    .rename("time_of_default")
+)
 
 
 def compute_target_correct(row, df_defaults):
@@ -69,8 +101,20 @@ def compute_target_correct(row, df_defaults):
         return 0
 
 
-train["TARGET"] = train.apply(compute_target_correct, args=(default_date,), axis=1)
-test["TARGET"] = test.apply(compute_target_correct, args=(default_date,), axis=1)
+# Vectorized PD-12M target: TARGET=1 if default occurs within next 12 months
+def _add_target(df: pd.DataFrame, defaults: pd.Series) -> pd.DataFrame:
+    out = df.merge(defaults, on="id", how="left")
+    months_until_default = out["time_of_default"] - out["time"]
+    out["TARGET"] = (
+        out["time_of_default"].notna()
+        & months_until_default.between(0, 12, inclusive="both")
+    ).astype(int)
+    out.drop(columns=["time_of_default"], inplace=True)
+    return out
+
+
+train = _add_target(train, default_date)
+test = _add_target(test, default_date)
 
 
 # %% 3
@@ -157,7 +201,8 @@ client_features_test = (
 X_cluster_test = scaler.transform(client_features_test[cluster_vars])
 client_features_test["cluster_id"] = kmeans.predict(X_cluster_test)
 
-test = test.merge(client_features_test[["id", "cluster_id"]], on="id", how="left")
+test = test.merge(
+    client_features_test[["id", "cluster_id"]], on="id", how="left")
 
 assert train.groupby("id")["cluster_id"].nunique().max() == 1
 assert test.groupby("id")["cluster_id"].nunique().max() == 1
@@ -165,7 +210,8 @@ assert test.groupby("id")["cluster_id"].nunique().max() == 1
 train["cluster_id"] = train["cluster_id"].astype("category")
 test["cluster_id"] = test["cluster_id"].astype("category")
 
-clients_per_cluster = train.groupby("cluster_id")["id"].nunique()
+clients_per_cluster = train.groupby(
+    "cluster_id", observed=True)["id"].nunique()
 print(clients_per_cluster)
 
 print(
@@ -201,8 +247,8 @@ binning_process = BinningProcess(
     binning_fit_params={var: {"solver": "mip"} for var in predictors},
 )
 
-y_train = train["TARGET"]
-y_test = test["TARGET"]
+y_train = train["TARGET"].astype(int)
+y_test = test["TARGET"].astype(int)
 test_ids = test["id"]
 train_ids = train["id"]
 
@@ -267,7 +313,7 @@ while True:
     # dataframe with p-values
     p_values = pd.Series(index=not_selected, dtype="float64")
 
-    ## forward step
+    # forward step
     # loop over not selected columns
     for key in not_selected:
         # estimate model
