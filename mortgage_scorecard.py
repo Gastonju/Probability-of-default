@@ -2,6 +2,7 @@
 # imports
 import pandas as pd
 import numpy as np
+from sklearn.model_selection import train_test_split
 import statsmodels.api as sm
 from optbinning import BinningProcess
 from sklearn import metrics
@@ -9,8 +10,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from sklearn.cluster import KMeans
+from sklearn.metrics import confusion_matrix
 from sklearn.preprocessing import StandardScaler
-
+from sklearn.cluster import KMeans
 
 # %% 1. Data Import
 data = pd.read_csv("mortgage_sample.csv")
@@ -25,53 +27,51 @@ data = pd.read_csv("mortgage_sample.csv")
 
 data["max_time_per_loan"] = data.groupby("id")["time"].transform("max")
 data["orig_time_per_loan"] = data.groupby("id")["orig_time"].transform("first")
-data["age"] = data.groupby("id").cumcount() + 1
+data["age"] = data["time"] - data["orig_time"]
 data["max_age"] = data.groupby("id")["age"].transform("max")
+data = data[data["orig_time"] == 25]
 
-data = data
+data.to_csv("mortgage_full_sample.csv", index=False)
 
-
-data = data[(data["max_age"] >= 12)]
+# %%
 
 # TODO: Need to add split into train and test!
 data = data[(data["sample"] == "public")]
 
-loan_recency = (
-    data.groupby("id")["time"].max().reset_index().rename(columns={"time": "last_time"})
+
+loan_end = data.groupby("id").agg(
+    final_status=("status_time", "max"), end_time=("time", "max")
 )
+data = data.merge(loan_end, on="id", how="left")
 
-loan_recency = loan_recency.sort_values("last_time")
 
-index = int(0.8 * len(loan_recency))
+def compute_target_robust(row):
+    horizon = row["time"] + 12
+    # Si le prêt finit par un défaut
+    if row["final_status"] == 1:
+        # Et que le défaut est dans l'horizon -> 1
+        if row["end_time"] <= horizon:
+            return 1
+        else:
+            return 0
+    # Si le prêt est remboursé (2) ou actif (0)
+    else:
+        # Si on a observé le prêt jusqu'à l'horizon -> 0 (Sûr)
+        if row["end_time"] >= horizon:
+            return 0
+        # Sinon -> NaN (On ne sait pas, on exclut)
+        else:
+            return np.nan
 
-train_ids = loan_recency.iloc[:index]["id"]
-test_ids = loan_recency.iloc[index:]["id"]
+
+data["TARGET"] = data.apply(compute_target_robust, axis=1)
+data_model = data.dropna(subset=["TARGET"])
+
+unique_ids = data["id"].unique()
+train_ids, test_ids = train_test_split(unique_ids, test_size=0.2, random_state=42)
 
 train = data[data["id"].isin(train_ids)]
 test = data[data["id"].isin(test_ids)]
-
-default_date = data[data["default_time"] == 1].groupby("id")["time"].min()
-
-
-def compute_target_correct(row, df_defaults):
-    current_id = row["id"]
-    current_time = row["time"]
-
-    if current_id not in df_defaults.index:
-        return 0
-
-    time_of_default = df_defaults[current_id]
-    months_until_default = time_of_default - current_time
-
-    if 0 <= months_until_default <= 12:
-        return 1
-    else:
-        return 0
-
-
-train["TARGET"] = train.apply(compute_target_correct, args=(default_date,), axis=1)
-test["TARGET"] = test.apply(compute_target_correct, args=(default_date,), axis=1)
-
 
 # %% 3
 # training_set = sample
@@ -89,32 +89,62 @@ sample = train.copy()
 
 
 # %% 3. Predictor preparation
-cluster_vars = [
-    "LTV_mean",
-    "LTV_max",
-    "balance_mean",
-    "balance_max",
-    "uer_mean",
-    "interest_rate_mean",
-    "hpi_ratio_mean",
-    "stress_index_mean",
-    "interest_burden_mean",
-]
 
-train["hpi_ratio"] = train["hpi_time"] / train["hpi_orig_time"]
-train["stress_index"] = train["uer_time"] * train["LTV_time"]
-train["interest_burden"] = train["balance_time"] * train["interest_rate_time"]
+train = train.sort_values(["id", "time"]).copy()
+test = test.sort_values(["id", "time"]).copy()
 
-test["hpi_ratio"] = test["hpi_time"] / test["hpi_orig_time"]
-test["stress_index"] = test["uer_time"] * test["LTV_time"]
-test["interest_burden"] = test["balance_time"] * test["interest_rate_time"]
+for df in (train, test):
+    df["hpi_ratio"] = df["hpi_time"] / df["hpi_orig_time"]
+    df["stress_index"] = df["uer_time"] * df["LTV_time"]
+    df["interest_burden"] = df["balance_time"] * df["interest_rate_time"]
 
+# variation (trend) features
+for df in (train, test):
+    # month-to-month changes
+    df["d_LTV_1m"] = df.groupby("id")["LTV_time"].diff(1)
+    df["d_bal_1m"] = df.groupby("id")["balance_time"].diff(1)
+    df["d_rate_1m"] = df.groupby("id")["interest_rate_time"].diff(1)
+    df["d_uer_1m"] = df.groupby("id")["uer_time"].diff(1)
+    df["d_hpi_ratio_1m"] = df.groupby("id")["hpi_ratio"].diff(1)
+    df["d_gdp_1m"] = df.groupby("id")["gdp_time"].diff(1)
 
+    # smothing features
+    df["LTV_roll_mean_3m"] = df.groupby("id")["LTV_time"].transform(
+        lambda s: s.rolling(3, min_periods=1).mean()
+    )
+    df["LTV_roll_std_6m"] = df.groupby("id")["LTV_time"].transform(
+        lambda s: s.rolling(6, min_periods=2).std()
+    )
+
+    df["gdp_roll_mean_3m"] = df.groupby("id")["gdp_time"].transform(
+        lambda s: s.rolling(3, min_periods=1).mean()
+    )
+    df["gdp_roll_std_6m"] = df.groupby("id")["gdp_time"].transform(
+        lambda s: s.rolling(6, min_periods=2).std()
+    )
+
+    df["bal_roll_mean_3m"] = df.groupby("id")["balance_time"].transform(
+        lambda s: s.rolling(3, min_periods=1).mean()
+    )
+    df["bal_roll_std_6m"] = df.groupby("id")["balance_time"].transform(
+        lambda s: s.rolling(6, min_periods=2).std()
+    )
+
+    df["stress_roll_mean_3m"] = df.groupby("id")["stress_index"].transform(
+        lambda s: s.rolling(3, min_periods=1).mean()
+    )
+    df["stress_roll_std_6m"] = df.groupby("id")["stress_index"].transform(
+        lambda s: s.rolling(6, min_periods=2).std()
+    )
+
+# Client level aggregation for clustering
 client_features = (
     train.groupby("id")
     .agg(
         LTV_mean=("LTV_time", "mean"),
         LTV_max=("LTV_time", "max"),
+        gdp_mean=("gdp_time", "mean"),
+        gdp_max=("gdp_time", "max"),
         balance_mean=("balance_time", "mean"),
         balance_max=("balance_time", "max"),
         uer_mean=("uer_time", "mean"),
@@ -122,27 +152,41 @@ client_features = (
         hpi_ratio_mean=("hpi_ratio", "mean"),
         stress_index_mean=("stress_index", "mean"),
         interest_burden_mean=("interest_burden", "mean"),
+        gdp_d_max=("d_gdp_1m", "max"),
+        LTV_std=("LTV_time", "std"),
+        balance_std=("balance_time", "std"),
+        stress_index_std=("stress_index", "std"),
+        gdp_std=("gdp_time", "std"),
+        LTV_last=("LTV_time", "last"),
+        balance_last=("balance_time", "last"),
+        uer_last=("uer_time", "last"),
+        rate_last=("interest_rate_time", "last"),
+        hpi_ratio_last=("hpi_ratio", "last"),
+        LTV_recent_mean_3m=("LTV_roll_mean_3m", "last"),
+        LTV_recent_std_6m=("LTV_roll_std_6m", "last"),
+        bal_recent_mean_3m=("bal_roll_mean_3m", "last"),
+        bal_recent_std_6m=("bal_roll_std_6m", "last"),
+        stress_recent_mean_3m=("stress_roll_mean_3m", "last"),
+        stress_recent_std_6m=("stress_roll_std_6m", "last"),
+        gdp_recent_mean_3m=("gdp_roll_mean_3m", "last"),
+        gdp_recent_std_6m=("gdp_roll_std_6m", "last"),
+        d_LTV_mean=("d_LTV_1m", "mean"),
+        d_bal_mean=("d_bal_1m", "mean"),
+        d_rate_mean=("d_rate_1m", "mean"),
+        d_uer_mean=("d_uer_1m", "mean"),
+        d_hpi_ratio_mean=("d_hpi_ratio_1m", "mean"),
+        d_gdp_mean=("d_gdp_1m", "mean"),
     )
     .reset_index()
 )
-
-
-sil_scores = []
-
-
-scaler = StandardScaler()
-X_cluster_train = scaler.fit_transform(client_features[cluster_vars])
-
-kmeans = KMeans(n_clusters=4, random_state=42)
-client_features["cluster_id"] = kmeans.fit_predict(X_cluster_train)
-
-train = train.merge(client_features[["id", "cluster_id"]], on="id", how="left")
 
 client_features_test = (
     test.groupby("id")
     .agg(
         LTV_mean=("LTV_time", "mean"),
         LTV_max=("LTV_time", "max"),
+        gdp_mean=("gdp_time", "mean"),
+        gdp_max=("gdp_time", "max"),
         balance_mean=("balance_time", "mean"),
         balance_max=("balance_time", "max"),
         uer_mean=("uer_time", "mean"),
@@ -150,24 +194,104 @@ client_features_test = (
         hpi_ratio_mean=("hpi_ratio", "mean"),
         stress_index_mean=("stress_index", "mean"),
         interest_burden_mean=("interest_burden", "mean"),
+        gdp_d_max=("d_gdp_1m", "max"),
+        LTV_std=("LTV_time", "std"),
+        balance_std=("balance_time", "std"),
+        stress_index_std=("stress_index", "std"),
+        gdp_std=("gdp_time", "std"),
+        LTV_last=("LTV_time", "last"),
+        balance_last=("balance_time", "last"),
+        uer_last=("uer_time", "last"),
+        rate_last=("interest_rate_time", "last"),
+        hpi_ratio_last=("hpi_ratio", "last"),
+        LTV_recent_mean_3m=("LTV_roll_mean_3m", "last"),
+        LTV_recent_std_6m=("LTV_roll_std_6m", "last"),
+        bal_recent_mean_3m=("bal_roll_mean_3m", "last"),
+        bal_recent_std_6m=("bal_roll_std_6m", "last"),
+        stress_recent_mean_3m=("stress_roll_mean_3m", "last"),
+        stress_recent_std_6m=("stress_roll_std_6m", "last"),
+        gdp_recent_mean_3m=("gdp_roll_mean_3m", "last"),
+        gdp_recent_std_6m=("gdp_roll_std_6m", "last"),
+        d_LTV_mean=("d_LTV_1m", "mean"),
+        d_bal_mean=("d_bal_1m", "mean"),
+        d_rate_mean=("d_rate_1m", "mean"),
+        d_uer_mean=("d_uer_1m", "mean"),
+        d_hpi_ratio_mean=("d_hpi_ratio_1m", "mean"),
+        d_gdp_mean=("d_gdp_1m", "mean"),
     )
     .reset_index()
 )
 
-X_cluster_test = scaler.transform(client_features_test[cluster_vars])
-client_features_test["cluster_id"] = kmeans.predict(X_cluster_test)
+# which variables to use for clustering
+cluster_vars = [
+    "LTV_mean",
+    "LTV_max",
+    "LTV_std",
+    "LTV_last",
+    "balance_mean",
+    "balance_max",
+    "balance_std",
+    "balance_last",
+    "uer_mean",
+    "uer_last",
+    "interest_rate_mean",
+    "rate_last",
+    "hpi_ratio_mean",
+    "hpi_ratio_last",
+    "stress_index_mean",
+    "stress_index_std",
+    "interest_burden_mean",
+    "LTV_recent_mean_3m",
+    "LTV_recent_std_6m",
+    "stress_recent_mean_3m",
+    "stress_recent_std_6m",
+    "d_LTV_mean",
+    "d_bal_mean",
+    "d_rate_mean",
+    "d_uer_mean",
+    "d_hpi_ratio_mean",
+    "d_gdp_mean",
+    "gdp_d_max",
+    "gdp_mean",
+]
 
+# Handle NaNs (std/diff/rolling may create NaNs)
+client_features[cluster_vars] = (
+    client_features[cluster_vars].replace([np.inf, -np.inf], np.nan).fillna(0)
+)
+client_features_test[cluster_vars] = (
+    client_features_test[cluster_vars].replace([np.inf, -np.inf], np.nan).fillna(0)
+)
+
+
+scaler = StandardScaler()
+X_train = scaler.fit_transform(client_features[cluster_vars])
+X_test = scaler.transform(client_features_test[cluster_vars])
+
+
+kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
+client_features["cluster_id"] = kmeans.fit_predict(X_train)
+client_features_test["cluster_id"] = kmeans.predict(X_test)
+
+# Merge cluster id back to panel
+train = train.merge(client_features[["id", "cluster_id"]], on="id", how="left")
 test = test.merge(client_features_test[["id", "cluster_id"]], on="id", how="left")
 
+# Sanity checks
 assert train.groupby("id")["cluster_id"].nunique().max() == 1
 assert test.groupby("id")["cluster_id"].nunique().max() == 1
+assert train["cluster_id"].isna().sum() == 0
+assert test["cluster_id"].isna().sum() == 0
 
 train["cluster_id"] = train["cluster_id"].astype("category")
 test["cluster_id"] = test["cluster_id"].astype("category")
 
+# Quick cluster stats
 clients_per_cluster = train.groupby("cluster_id")["id"].nunique()
+print("Clients per cluster (train):")
 print(clients_per_cluster)
 
+print("\nClient-level default rate by cluster (train):")
 print(
     train.groupby(["cluster_id", "id"], observed=True)["TARGET"]
     .max()
@@ -216,11 +340,21 @@ test_woe = binning_process.transform(test[predictors], metric="woe")
 test_woe.to_csv("mortgage_test_woe.csv", index=False)
 train_woe.to_csv("mortgage_train_woe.csv", index=False)
 
+# %%
 
 # TODO: Multivariate (correlation) check
 
 # remove hpi_origin_time due to high correlation with orig_time_per_loan
-to_remove = ["orig_time_per_loan", "orig_time", "LTV_time", "balance_time"]
+to_remove = [
+    "orig_time_per_loan",
+    "orig_time",
+    "LTV_time",
+    "balance_time",
+    "gdp_time",
+    "stress_index",
+    "LTV_roll_mean_3m",
+    "hpi_ratio",
+]
 train_woe = train_woe.drop(columns=to_remove, errors="ignore")
 test_woe = test_woe.drop(columns=to_remove, errors="ignore")
 
@@ -257,7 +391,7 @@ estimated_model.summary()
 # Implement forward regression, start with intercept
 selected = ["const"]
 not_selected = [key for key in X.columns if key not in selected]
-p_value = 0.01
+p_value = 0.05
 
 while True:
     # model changed?
@@ -304,17 +438,12 @@ while True:
 logit_mod = sm.Logit(endog=y_train, exog=X[selected])
 estimated_model = logit_mod.fit(disp=0)
 y_pred = estimated_model.predict(test_woe[selected])
+threshold = np.quantile(y_pred, 0.70)
+
 
 # TODO: Check the final model quality - p-values? Coefficient signs?
 estimated_model.summary()
 
-pd.DataFrame({"TARGET": y_test, "PD": y_pred}).groupby("TARGET").mean()
-
-tmp = pd.DataFrame({"TARGET": y_test.values, "PD": y_pred})
-print(tmp.groupby("TARGET")["PD"].describe())
-
-print("Médiane PD défaut:", tmp[tmp.TARGET == 1].PD.median())
-print("Médiane PD non-défaut:", tmp[tmp.TARGET == 0].PD.median())
 
 # %% 6. Train Performance assessment
 # TODO: GINI is the most common metric for assessing predictive power
@@ -328,6 +457,38 @@ plt.show()
 
 # TODO: Other model assessment dimensions
 
+y_pred_const = (y_pred >= 0.1).astype(int)
+tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const).ravel()
+
+benchmark = pd.DataFrame(
+    columns=[
+        "Model name",
+        "GINI",
+        "Pseudo R2",
+        "Sensitivity",
+        "Specificity",
+        "Accuracy",
+        "Precision",
+    ]
+)
+
+benchmark.loc[len(benchmark)] = {
+    "Model name": "Logit Clustered",
+    "GINI": 2 * auc - 1,
+    "Pseudo R2": estimated_model.prsquared,
+    "Sensitivity": tp / (tp + fn) if (tp + fn) > 0 else np.nan,
+    "Specificity": tn / (tn + fp) if (tn + fp) > 0 else np.nan,
+    "Accuracy": (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan,
+    "Precision": tp / (tp + fp) if (tp + fp) > 0 else np.nan,
+}
+
+print(benchmark)
+
+nb_default_clients = train.groupby("id")["TARGET"].max().sum()
+
+
+nb_default_clients_rate = test.groupby("id")["TARGET"].max().mean()
+print(nb_default_clients_rate)
 
 # %% 7. Test Performance assessment
 # TODO: Make sure to check for overfitting!
