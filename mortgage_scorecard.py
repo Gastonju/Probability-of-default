@@ -67,7 +67,7 @@ def compute_target_robust(row):
 
 
 data["TARGET"] = data.apply(compute_target_robust, axis=1)
-data_model = data.dropna(subset=["TARGET"])
+data_model = data.dropna(subset=["TARGET"]).copy()
 
 unique_ids = data["id"].unique()
 train_ids, test_ids = train_test_split(unique_ids, test_size=0.2, random_state=42)
@@ -412,20 +412,26 @@ estimated_model_step_regression.summary()
 
 # %% 6. Train Performance assessment
 # TODO: GINI is the most common metric for assessing predictive power
-fpr, tpr, _ = metrics.roc_curve(y_test, y_pred_step_regre)
-
+fpr, tpr, thresholds_step_regre = metrics.roc_curve(y_test, y_pred_step_regre)
+j_scores_step_regre = tpr - fpr
 auc = metrics.roc_auc_score(y_test, y_pred_step_regre)
+best_idx = np.argmax(j_scores_step_regre)
+best_threshold = thresholds_step_regre[best_idx]
 
+
+fpr, tpr, thresholds_full = metrics.roc_curve(y_test, y_pred)
+j_scores_full = tpr - fpr
 auc_full = metrics.roc_auc_score(y_test, y_pred)
-
-plt.plot(fpr, tpr, label="GINI=" + str(2 * auc - 1))
+best_idx_full = np.argmax(j_scores_full)
+best_threshold_full = thresholds_full[best_idx_full]
+plt.plot(fpr, tpr, label="GINI=" + str(2 * auc_full - 1))
 plt.legend(loc=4)
 plt.show()
 
-y_pred_const_step_regression = (y_pred_step_regre >= 0.41).astype(int)
+y_pred_const_step_regression = (y_pred_step_regre >= best_threshold).astype(int)
 tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const_step_regression).ravel()
 
-y_pred_const_full = (y_pred >= 0.41).astype(int)
+y_pred_const_full = (y_pred >= best_threshold_full).astype(int)
 tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const_full).ravel()
 
 benchmark.loc[len(benchmark)] = {
@@ -481,11 +487,14 @@ p_null = np.mean(y_test)
 ll_null = np.sum(y_test * np.log(p_null) + (1 - y_test) * np.log(1 - p_null))
 pseudo_r2 = 1 - ll_model / ll_null
 
-fpr, tpr, _ = metrics.roc_curve(y_test, y_pred_lasso)
+fpr, tpr, thresholds_lasso = metrics.roc_curve(y_test, y_pred_lasso)
 auc = metrics.roc_auc_score(y_test, y_pred_lasso)
 gini = 2 * auc - 1
 
-y_pred_const_lasso = (y_pred_lasso >= 0.41).astype(int)
+best_idx_lasso = np.argmax(tpr - fpr)
+best_threshold_lasso = thresholds_lasso[best_idx_lasso]
+
+y_pred_const_lasso = (y_pred_lasso >= best_threshold_lasso).astype(int)
 tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const_lasso).ravel()
 benchmark.loc[len(benchmark)] = {
     "Model name": "Logitistic Regression Lasso",
@@ -528,11 +537,14 @@ ll_null = np.sum(y_test * np.log(p_null) + (1 - y_test) * np.log(1 - p_null))
 pseudo_r2 = 1 - ll_model / ll_null
 
 # calculate GINI
-fpr, tpr, _ = metrics.roc_curve(y_test, y_pred_elas_net)
+fpr, tpr, thresholds_elas_net = metrics.roc_curve(y_test, y_pred_elas_net)
 auc = metrics.roc_auc_score(y_test, y_pred_elas_net)
 gini = 2 * auc - 1
 
-y_pred_const_elas_net = (y_pred_elas_net >= 0.41).astype(int)
+best_idx_elas_net = np.argmax(tpr - fpr)
+best_threshold_elas_net = thresholds_elas_net[best_idx_elas_net]
+
+y_pred_const_elas_net = (y_pred_elas_net >= best_threshold_elas_net).astype(int)
 tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const_elas_net).ravel()
 benchmark.loc[len(benchmark)] = {
     "Model name": "Logitistic Regression Elastic Net",
