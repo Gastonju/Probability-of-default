@@ -6,6 +6,7 @@ from statsmodels.stats.outliers_influence import variance_inflation_factor
 import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn import metrics
+from sklearn.model_selection import train_test_split
 from optbinning import BinningProcess
 import inspect
 import pandas as pd
@@ -61,21 +62,23 @@ data = data[(data["max_age"] >= 12)]
 
 # TODO: Need to add split into train and test!
 data = data[(data["sample"] == "public")]
-
-loan_recency = (
-    data.groupby("id")["time"].max().reset_index().rename(
-        columns={"time": "last_time"})
+id_event = (
+    data.groupby("id")["default_time"]
+        .max()
+        .reset_index()
+        .rename(columns={"default_time": "ever_default"})
 )
 
-loan_recency = loan_recency.sort_values("last_time")
+train_ids, test_ids = train_test_split(
+    id_event["id"],
+    test_size=0.2,
+    random_state=42,
+    stratify=id_event["ever_default"]
+)
 
-index = int(0.8 * len(loan_recency))
+train = data[data["id"].isin(train_ids)].copy()
+test = data[data["id"].isin(test_ids)].copy()
 
-train_ids = loan_recency.iloc[:index]["id"]
-test_ids = loan_recency.iloc[index:]["id"]
-
-train = data[data["id"].isin(train_ids)]
-test = data[data["id"].isin(test_ids)]
 
 default_date = (
     data.loc[data["default_time"] == 1]
@@ -101,14 +104,23 @@ def compute_target_correct(row, df_defaults):
         return 0
 
 
-# Vectorized PD-12M target: TARGET=1 if default occurs within next 12 months
+# PD-12M target at observation time t:
+# TARGET=1 if first default occurs in (t, t+12] months.
+# Also removes observations after default to prevent leakage.
 def _add_target(df: pd.DataFrame, defaults: pd.Series) -> pd.DataFrame:
     out = df.merge(defaults, on="id", how="left")
+
+    out = out[(out["time_of_default"].isna()) | (
+        out["time"] <= out["time_of_default"])].copy()
+
     months_until_default = out["time_of_default"] - out["time"]
+
     out["TARGET"] = (
         out["time_of_default"].notna()
-        & months_until_default.between(0, 12, inclusive="both")
+        & (months_until_default >= 1)
+        & (months_until_default <= 12)
     ).astype(int)
+
     out.drop(columns=["time_of_default"], inplace=True)
     return out
 
@@ -153,9 +165,13 @@ test["hpi_ratio"] = test["hpi_time"] / test["hpi_orig_time"]
 test["stress_index"] = test["uer_time"] * test["LTV_time"]
 test["interest_burden"] = test["balance_time"] * test["interest_rate_time"]
 
+train_pit = train.sort_values(["id", "time"]).groupby(
+    "id", as_index=False).head(1)
+test_pit = test.sort_values(["id", "time"]).groupby(
+    "id", as_index=False).head(1)
 
 client_features = (
-    train.groupby("id")
+    train_pit.groupby("id")
     .agg(
         LTV_mean=("LTV_time", "mean"),
         LTV_max=("LTV_time", "max"),
@@ -183,7 +199,7 @@ client_features["cluster_id"] = kmeans.fit_predict(X_cluster_train)
 train = train.merge(client_features[["id", "cluster_id"]], on="id", how="left")
 
 client_features_test = (
-    test.groupby("id")
+    test_pit.groupby("id")
     .agg(
         LTV_mean=("LTV_time", "mean"),
         LTV_max=("LTV_time", "max"),
@@ -240,6 +256,8 @@ cols_to_drop = [
 
 
 predictors = [col for col in train.columns if col not in cols_to_drop]
+if "cluster_id" in predictors:
+    predictors.remove("cluster_id")
 
 binning_process = BinningProcess(
     variable_names=predictors,
@@ -259,6 +277,24 @@ binning_process.summary()
 train_woe = binning_process.transform(train[predictors], metric="woe")
 test_woe = binning_process.transform(test[predictors], metric="woe")
 
+train_woe, test_woe = train_woe.align(
+    test_woe, join="left", axis=1, fill_value=0)
+
+train_cluster_d = pd.get_dummies(
+    train["cluster_id"], prefix="cluster", drop_first=True)
+test_cluster_d = pd.get_dummies(
+    test["cluster_id"],  prefix="cluster", drop_first=True)
+
+test_cluster_d = test_cluster_d.reindex(
+    columns=train_cluster_d.columns, fill_value=0)
+
+# Make dummies numeric explicitly
+train_cluster_d = train_cluster_d.astype(float)
+test_cluster_d = test_cluster_d.astype(float)
+
+train_woe = pd.concat([train_woe, train_cluster_d], axis=1)
+test_woe = pd.concat([test_woe,  test_cluster_d], axis=1)
+
 test_woe.to_csv("mortgage_test_woe.csv", index=False)
 train_woe.to_csv("mortgage_train_woe.csv", index=False)
 
@@ -277,26 +313,62 @@ ax.set_title("Correlation Matrix Heatmap")
 plt.show()
 
 # Calculation VIF
-vif_data = pd.DataFrame()
-vif_data["Variable"] = train_woe.columns
-vif_data["VIF"] = [
-    variance_inflation_factor(train_woe.values, i) for i in range(train_woe.shape[1])
-]
+# VIF requires numeric + finite
+train_woe = train_woe.apply(pd.to_numeric, errors="coerce")
+test_woe = test_woe.apply(pd.to_numeric, errors="coerce")
 
+train_woe = train_woe.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+test_woe = test_woe.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+# Drop constant columns
+const_cols = [
+    c for c in train_woe.columns if train_woe[c].nunique(dropna=False) <= 1]
+if const_cols:
+    print("Dropping constant columns for VIF:", const_cols)
+    train_woe = train_woe.drop(columns=const_cols)
+    test_woe = test_woe.drop(columns=const_cols, errors="ignore")
+
+vif_data = pd.DataFrame()
+X_vif = sm.add_constant(train_woe, has_constant="add")
+
+vif_data = pd.DataFrame({
+    "Variable": X_vif.columns,
+    "VIF": [
+        variance_inflation_factor(X_vif.to_numpy(dtype=float), i)
+        for i in range(X_vif.shape[1])
+    ]
+})
+
+# Drop intercept from report
+vif_data = vif_data[vif_data["Variable"] != "const"]
 print(vif_data.sort_values("VIF", ascending=False))
 
 
 # %% 4. Modelling
 # TODO: Think carefully about predictors we want to add
-X = train_woe
-X = sm.add_constant(X, has_constant="add")
-test_woe = sm.add_constant(test_woe, has_constant="add")
+# Ensure model matrices are strictly numeric + finite (statsmodels requirement)
+train_woe = train_woe.apply(pd.to_numeric, errors="coerce")
+test_woe = test_woe.apply(pd.to_numeric, errors="coerce")
 
+train_woe = train_woe.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+test_woe = test_woe.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+# Align columns/order one last time (prevents train/test mismatch)
+train_woe, test_woe = train_woe.align(
+    test_woe, join="left", axis=1, fill_value=0.0)
+
+# Build exog matrices
+X = sm.add_constant(train_woe, has_constant="add")
+X_test = sm.add_constant(test_woe, has_constant="add")
+
+# Force float dtype explicitly
+X = X.astype(float)
+X_test = X_test.astype(float)
 
 # %% Simple regression estimation
-logit_mod = sm.Logit(endog=y_train, exog=X)
-estimated_model = logit_mod.fit(disp=0)
-estimated_model.summary()
+logit_mod = sm.Logit(endog=y_train.astype(int), exog=X)
+estimated_model = logit_mod.fit_regularized(alpha=1.0, L1_wt=0.0)
+print(estimated_model.summary())
 
 
 # %% Stepwise selection can give us an idea about significant predictors of risk
@@ -349,24 +421,46 @@ while True:
 # TODO: Make sure to create several candidate models to compare
 logit_mod = sm.Logit(endog=y_train, exog=X[selected])
 estimated_model = logit_mod.fit(disp=0)
-y_pred = estimated_model.predict(test_woe[selected])
+y_pred = estimated_model.predict(X_test[selected])
 
 # TODO: Check the final model quality - p-values? Coefficient signs?
 estimated_model.summary()
 
-pd.DataFrame({"TARGET": y_test, "PD": y_pred}).groupby("TARGET").mean()
+# Attach scores to identifiers
+test_scored = test[["id", "time", "TARGET"]].copy()
+test_scored["PD"] = y_pred.values
 
-tmp = pd.DataFrame({"TARGET": y_test.values, "PD": y_pred})
-print(tmp.groupby("TARGET")["PD"].describe())
+# One score per loan: PD at first observation in test (PIT-at-start)
+loan_score = (
+    test_scored.sort_values(["id", "time"])
+    .groupby("id", as_index=False)
+    .first()[["id", "PD"]]
+)
 
-print("Médiane PD défaut:", tmp[tmp.TARGET == 1].PD.median())
-print("Médiane PD non-défaut:", tmp[tmp.TARGET == 0].PD.median())
+# One label per loan: did the loan EVER have TARGET=1 in the test panel?
+loan_label = (
+    test_scored.groupby("id", as_index=False)["TARGET"]
+    .max()
+    .rename(columns={"TARGET": "TARGET_loan"})
+)
+
+loan_level = loan_score.merge(loan_label, on="id", how="left")
+
+print(loan_level.groupby("TARGET_loan")["PD"].describe())
+print("Median PD default (loan):",
+      loan_level.loc[loan_level.TARGET_loan == 1, "PD"].median())
+print("Median PD non-default (loan):",
+      loan_level.loc[loan_level.TARGET_loan == 0, "PD"].median())
+
 
 # %% 6. Train Performance assessment
 # TODO: GINI is the most common metric for assessing predictive power
-fpr, tpr, _ = metrics.roc_curve(y_test, y_pred)
 
-auc = metrics.roc_auc_score(y_test, y_pred)
+y_true_loan = loan_level["TARGET_loan"].values
+y_score_loan = loan_level["PD"].values
+
+fpr, tpr, _ = metrics.roc_curve(y_true_loan, y_score_loan)
+auc = metrics.roc_auc_score(y_true_loan, y_score_loan)
 
 plt.plot(fpr, tpr, label="GINI=" + str(2 * auc - 1))
 plt.legend(loc=4)
