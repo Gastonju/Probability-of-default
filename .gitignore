@@ -1,1 +1,5 @@
 *.csv
+# Generated artifacts
+mortgage_train_woe.csv
+mortgage_test_woe.csv
+
