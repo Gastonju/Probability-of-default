@@ -2,6 +2,7 @@
 # imports
 import pandas as pd
 import numpy as np
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 import statsmodels.api as sm
 from optbinning import BinningProcess
@@ -101,6 +102,27 @@ for df in (train, test):
     df["hpi_ratio"] = df["hpi_time"] / df["hpi_orig_time"]
     df["stress_index"] = df["uer_time"] * df["LTV_time"]
     df["interest_burden"] = df["balance_time"] * df["interest_rate_time"]
+    df["LTV_x_FICO"] = df["LTV_time"] * df["FICO_orig_time"]
+    df["LTV_x_interest"] = df["LTV_time"] * df["interest_rate_time"]
+    df["uer_lag3"] = df.groupby("id")["uer_time"].shift(3)
+    df["hpi_lag3"] = df.groupby("id")["hpi_time"].shift(3)
+
+# if user unemployment rate increase default now ?
+for df in (train, test):
+    df["uer_lag6"] = df.groupby("id")["uer_time"].shift(6)
+    df["uer_lag3"] = df["uer_lag3"].fillna(df["uer_time"])
+    df["hpi_lag3"] = df["hpi_lag3"].fillna(df["hpi_time"])
+    df["uer_lag6"] = df["uer_lag6"].fillna(df["uer_time"])
+
+# integration non-linear
+for df in (train, test):
+    df["LTV_time_sq"] = df["LTV_time"] ** 2
+    df["balance_time_sq"] = df["balance_time"] ** 2
+    df["interest_rate_time_sq"] = df["interest_rate_time"] ** 2
+    df["uer_time_sq"] = df["uer_time"] ** 2
+    df["hpi_ratio_sq"] = df["hpi_ratio"] ** 2
+    df["gdp_time_sq"] = df["gdp_time"] ** 2
+
 
 # variation (trend) features
 for df in (train, test):
@@ -175,7 +197,7 @@ cluster_vars = [
     "investor_orig_time",
 ]
 
-# Handle NaNs (std/diff/rolling may create NaNs)
+
 client_features[cluster_vars] = (
     client_features[cluster_vars].replace([np.inf, -np.inf], np.nan).fillna(0)
 )
@@ -197,7 +219,7 @@ client_features_test["cluster_id"] = kmeans.predict(X_test)
 train = train.merge(client_features[["id", "cluster_id"]], on="id", how="left")
 test = test.merge(client_features_test[["id", "cluster_id"]], on="id", how="left")
 
-# Sanity checks
+
 assert train.groupby("id")["cluster_id"].nunique().max() == 1
 assert test.groupby("id")["cluster_id"].nunique().max() == 1
 assert train["cluster_id"].isna().sum() == 0
@@ -206,7 +228,7 @@ assert test["cluster_id"].isna().sum() == 0
 train["cluster_id"] = train["cluster_id"].astype("category")
 test["cluster_id"] = test["cluster_id"].astype("category")
 
-# Quick cluster stats
+
 clients_per_cluster = train.groupby("cluster_id")["id"].nunique()
 print("Clients per cluster (train):")
 print(clients_per_cluster)
@@ -275,6 +297,11 @@ to_remove = [
     "stress_index",
     "LTV_roll_mean_3m",
     "hpi_ratio",
+    "hpi_ratio_sq",
+    "interest_rate_time_sq",
+    "uer_time_sq",
+    "bal_roll_mean_3m",
+    "age",
 ]
 
 
@@ -306,9 +333,22 @@ test_woe = sm.add_constant(test_woe, has_constant="add")
 
 # %% Simple regression estimation
 logit_mod = sm.Logit(endog=y_train, exog=X)
-estimated_model = logit_mod.fit(disp=0)
-estimated_model.summary()
+estimated_model_full = logit_mod.fit(disp=0)
+y_pred = estimated_model_full.predict(test_woe)
 
+estimated_model_full.summary()
+
+benchmark = pd.DataFrame(
+    columns=[
+        "Model name",
+        "GINI",
+        "Pseudo R2",
+        "Sensitivity",
+        "Specificity",
+        "Accuracy",
+        "Precision",
+    ]
+)
 
 # %% Stepwise selection can give us an idea about significant predictors of risk
 # Implement forward regression, start with intercept
@@ -357,61 +397,140 @@ while True:
 
 
 # %% 5. Estimate final model
+
 # TODO: Make sure to create several candidate models to compare
 logit_mod = sm.Logit(endog=y_train, exog=X[selected])
-estimated_model = logit_mod.fit(disp=0)
-y_pred = estimated_model.predict(test_woe[selected])
-threshold = np.quantile(y_pred, 0.50)
-
+estimated_model_step_regression = logit_mod.fit(disp=0)
+y_pred_step_regre = estimated_model_step_regression.predict(test_woe[selected])
 
 # TODO: Check the final model quality - p-values? Coefficient signs?
-estimated_model.summary()
+estimated_model_step_regression.summary()
 
 
 # %% 6. Train Performance assessment
 # TODO: GINI is the most common metric for assessing predictive power
-fpr, tpr, _ = metrics.roc_curve(y_test, y_pred)
+fpr, tpr, _ = metrics.roc_curve(y_test, y_pred_step_regre)
 
-auc = metrics.roc_auc_score(y_test, y_pred)
+auc = metrics.roc_auc_score(y_test, y_pred_step_regre)
 
 plt.plot(fpr, tpr, label="GINI=" + str(2 * auc - 1))
 plt.legend(loc=4)
 plt.show()
 
-# TODO: Other model assessment dimensions
+y_pred_const_step_regression = (y_pred_step_regre >= 0.41).astype(int)
+tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const_step_regression).ravel()
 
-y_pred_const = (y_pred >= threshold).astype(int)
-tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const).ravel()
-
-benchmark = pd.DataFrame(
-    columns=[
-        "Model name",
-        "GINI",
-        "Pseudo R2",
-        "Sensitivity",
-        "Specificity",
-        "Accuracy",
-        "Precision",
-    ]
-)
+y_pred_const_full = (y_pred >= 0.41).astype(int)
+tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const_full).ravel()
 
 benchmark.loc[len(benchmark)] = {
-    "Model name": "Logit Clustered",
+    "Model name": "Logitistic Regression Full",
     "GINI": 2 * auc - 1,
-    "Pseudo R2": estimated_model.prsquared,
+    "Pseudo R2": estimated_model_full.prsquared,
     "Sensitivity": tp / (tp + fn) if (tp + fn) > 0 else np.nan,
     "Specificity": tn / (tn + fp) if (tn + fp) > 0 else np.nan,
     "Accuracy": (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan,
     "Precision": tp / (tp + fp) if (tp + fp) > 0 else np.nan,
 }
 
-print(benchmark)
+benchmark.loc[len(benchmark)] = {
+    "Model name": "Logitistic Regression stepwise",
+    "GINI": 2 * auc - 1,
+    "Pseudo R2": estimated_model_step_regression.prsquared,
+    "Sensitivity": tp / (tp + fn) if (tp + fn) > 0 else np.nan,
+    "Specificity": tn / (tn + fp) if (tn + fp) > 0 else np.nan,
+    "Accuracy": (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan,
+    "Precision": tp / (tp + fp) if (tp + fp) > 0 else np.nan,
+}
 
-nb_default_clients = train.groupby("id")["TARGET"].max().sum()
+# TODO: Other model assessment dimensions
+
+# %% lasso regression estimation
+
+if "const" in X.columns:
+    X = X.drop(columns="const")
+if "const" in test_woe.columns:
+    test_woe = test_woe.drop(columns="const")
+
+lasso_model = LogisticRegression(
+    penalty="l1", solver="liblinear", C=0.01, random_state=42
+)
+lasso_model.fit(X, y_train)
+y_pred_lasso = lasso_model.predict_proba(test_woe)[:, 1]
+
+# calculate prsquare
+ll_model = np.sum(
+    y_test * np.log(y_pred_lasso + 1e-15)
+    + (1 - y_test) * np.log(1 - y_pred_lasso + 1e-15)
+)
+
+p_null = np.mean(y_test)
+ll_null = np.sum(y_test * np.log(p_null) + (1 - y_test) * np.log(1 - p_null))
+pseudo_r2 = 1 - ll_model / ll_null
+
+fpr, tpr, _ = metrics.roc_curve(y_test, y_pred_lasso)
+auc = metrics.roc_auc_score(y_test, y_pred_lasso)
+gini = 2 * auc - 1
+
+y_pred_const_lasso = (y_pred_lasso >= 0.41).astype(int)
+tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const_lasso).ravel()
+benchmark.loc[len(benchmark)] = {
+    "Model name": "Logitistic Regression Lasso",
+    "GINI": 2 * auc - 1,
+    "Pseudo R2": pseudo_r2,
+    "Sensitivity": tp / (tp + fn) if (tp + fn) > 0 else np.nan,
+    "Specificity": tn / (tn + fp) if (tn + fp) > 0 else np.nan,
+    "Accuracy": (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan,
+    "Precision": tp / (tp + fp) if (tp + fp) > 0 else np.nan,
+}
+
+# %% elastic bet regression estimation
+
+if "const" in X.columns:
+    X = X.drop(columns="const")
+if "const" in test_woe.columns:
+    test_woe = test_woe.drop(columns="const")
+
+lasso_model = LogisticRegression(
+    penalty="elasticnet",
+    solver="saga",
+    l1_ratio=0.5,
+    C=0.01,
+    random_state=42,
+)
+lasso_model.fit(X, y_train)
+y_pred_elas_net = lasso_model.predict_proba(test_woe)[:, 1]
+
+# calculate prsquare
+ll_model = np.sum(
+    y_test * np.log(y_pred_elas_net + 1e-15)
+    + (1 - y_test) * np.log(1 - y_pred_elas_net + 1e-15)
+)
+
+p_null = np.mean(y_test)
+ll_null = np.sum(y_test * np.log(p_null) + (1 - y_test) * np.log(1 - p_null))
+pseudo_r2 = 1 - ll_model / ll_null
 
 
-nb_default_clients_rate = test.groupby("id")["TARGET"].max().mean()
-print(nb_default_clients_rate)
+fpr, tpr, _ = metrics.roc_curve(y_test, y_pred_elas_net)
+auc = metrics.roc_auc_score(y_test, y_pred_elas_net)
+gini = 2 * auc - 1
 
+y_pred_const_elas_net = (y_pred_elas_net >= 0.41).astype(int)
+tn, fp, fn, tp = confusion_matrix(y_test, y_pred_const_elas_net).ravel()
+benchmark.loc[len(benchmark)] = {
+    "Model name": "Logitistic Regression Elastic Net",
+    "GINI": 2 * auc - 1,
+    "Pseudo R2": pseudo_r2,
+    "Sensitivity": tp / (tp + fn) if (tp + fn) > 0 else np.nan,
+    "Specificity": tn / (tn + fp) if (tn + fp) > 0 else np.nan,
+    "Accuracy": (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan,
+    "Precision": tp / (tp + fp) if (tp + fp) > 0 else np.nan,
+}
 # %% 7. Test Performance assessment
 # TODO: Make sure to check for overfitting!
+print(benchmark)
+nb_default_clients = train.groupby("id")["TARGET"].max().mean()
+print("Overall default rate in training set:", nb_default_clients)
+
+# %%
