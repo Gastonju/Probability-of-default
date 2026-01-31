@@ -1,5 +1,6 @@
 # %% 0. Settings
 # imports
+from sklearn.metrics import brier_score_loss
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from statsmodels.stats.outliers_influence import variance_inflation_factor
@@ -254,10 +255,30 @@ cols_to_drop = [
     "max_age",
 ]
 
+# === GINI-driven variable pruning (before WOE binning)
+gin_neutral_vars = [
+    "uer_time",              # macro level, weak GINI contribution
+    "gdp_time",              # macro level, calibration not discrimination
+    "interest_rate_time",    # redundant with interest_burden / orig rate
+    "hpi_time",              # redundant if hpi_ratio is used
+]
 
-predictors = [col for col in train.columns if col not in cols_to_drop]
+
+predictors = [
+    col for col in train.columns
+    if col not in cols_to_drop
+]
+
+
 if "cluster_id" in predictors:
     predictors.remove("cluster_id")
+
+
+predictors = [
+    col for col in predictors
+    if col not in gin_neutral_vars
+]
+
 
 binning_process = BinningProcess(
     variable_names=predictors,
@@ -284,6 +305,9 @@ train_cluster_d = pd.get_dummies(
     train["cluster_id"], prefix="cluster", drop_first=True)
 test_cluster_d = pd.get_dummies(
     test["cluster_id"],  prefix="cluster", drop_first=True)
+
+train_cluster_d = train_cluster_d[["cluster_3"]]
+test_cluster_d = test_cluster_d[["cluster_3"]]
 
 test_cluster_d = test_cluster_d.reindex(
     columns=train_cluster_d.columns, fill_value=0)
@@ -455,18 +479,6 @@ print("Median PD non-default (loan):",
 
 # %% 6. Train Performance assessment
 # TODO: GINI is the most common metric for assessing predictive power
-
-y_true_loan = loan_level["TARGET_loan"].values
-y_score_loan = loan_level["PD"].values
-
-fpr, tpr, _ = metrics.roc_curve(y_true_loan, y_score_loan)
-auc = metrics.roc_auc_score(y_true_loan, y_score_loan)
-
-plt.plot(fpr, tpr, label="GINI=" + str(2 * auc - 1))
-plt.legend(loc=4)
-plt.show()
-
-# TODO: Other model assessment dimensions
 
 
 # %% 7. Test Performance assessment

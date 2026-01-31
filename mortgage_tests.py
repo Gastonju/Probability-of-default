@@ -14,8 +14,9 @@ data = pd.read_csv("mortgage_sample.csv")
 
 sample = data[(data["sample"] == "public")]
 
-# Drop rows with missing values in key columns 
-sample = sample.dropna(subset=["LTV_time", "FICO_orig_time", "default_time", "TARGET", "interest_rate_time"])
+# Drop rows with missing values in key columns
+sample = sample.dropna(subset=[
+                       "LTV_time", "FICO_orig_time", "default_time", "TARGET", "interest_rate_time"])
 
 # %% 3. GINI calculation
 # Simple model with two predictors and intercept
@@ -42,14 +43,17 @@ plt.show()
 
 # %% 4. Correlations
 # Correlation matrix
-corr_pearson = sample[["LTV_time", "FICO_orig_time", "interest_rate_time"]].corr(method="pearson")
+corr_pearson = sample[["LTV_time", "FICO_orig_time",
+                       "interest_rate_time"]].corr(method="pearson")
 print(corr_pearson)
 
-corr_spearman = sample[["LTV_time", "FICO_orig_time", "interest_rate_time"]].corr(method="spearman")
+corr_spearman = sample[["LTV_time", "FICO_orig_time",
+                        "interest_rate_time"]].corr(method="spearman")
 print(corr_spearman)
 
 # Scatter plot matrix
-pd.plotting.scatter_matrix(sample[["LTV_time", "FICO_orig_time", "interest_rate_time"]], alpha=0.2, figsize=(10, 10), diagonal='kde')
+pd.plotting.scatter_matrix(sample[["LTV_time", "FICO_orig_time",
+                           "interest_rate_time"]], alpha=0.2, figsize=(10, 10), diagonal='kde')
 plt.suptitle("Scatter Matrix")
 plt.show()
 
@@ -59,7 +63,7 @@ plt.show()
 def sommers_d(y_true, y_scores):
     y_true = np.array(y_true)
     y_scores = np.array(y_scores)
-    
+
     n = len(y_true)
     num_concordant = 0
     num_discordant = 0
@@ -67,7 +71,7 @@ def sommers_d(y_true, y_scores):
 
     for i in range(n):
         for j in range(i + 1, n):
-            if y_true[i] != y_true[j]:  
+            if y_true[i] != y_true[j]:
                 if y_scores[i] > y_scores[j]:
                     if y_true[i] > y_true[j]:
                         num_concordant += 1
@@ -78,7 +82,7 @@ def sommers_d(y_true, y_scores):
                         num_concordant += 1
                     else:
                         num_discordant += 1
-                else: 
+                else:
                     num_tied += 1
 
     total_pairs = num_concordant + num_discordant + num_tied
@@ -87,6 +91,7 @@ def sommers_d(y_true, y_scores):
 
     d = (num_concordant - num_discordant) / total_pairs
     return d
+
 
 # Take top 1000 observations by model score (y_pred)
 sample_small = sample.copy()
@@ -123,11 +128,11 @@ cal["bin"] = pd.qcut(cal["pd"], q=10, duplicates="drop")
 
 # Group by bins and calculate statistics
 cal_tbl = (cal.groupby("bin", observed=True)
-             .agg({
-                 "y": ["count", "sum", "mean"],
-                 "pd": "mean"
-             })
-             .round(4))
+           .agg({
+               "y": ["count", "sum", "mean"],
+               "pd": "mean"
+           })
+           .round(4))
 
 # Flatten column names
 cal_tbl.columns = ["n", "events", "DR", "PD"]
@@ -136,15 +141,18 @@ cal_tbl = cal_tbl.reset_index()
 # Z-statistic and p-value for binomial test
 cal_tbl["var"] = cal_tbl["PD"] * (1 - cal_tbl["PD"]) / cal_tbl["n"]
 cal_tbl["Z"] = (cal_tbl["DR"] - cal_tbl["PD"]) / np.sqrt(cal_tbl["var"])
-cal_tbl["p_value_norm"] = 2 * (1 - norm.cdf(np.abs(cal_tbl["Z"])))  # two-sided test
+cal_tbl["p_value_norm"] = 2 * \
+    (1 - norm.cdf(np.abs(cal_tbl["Z"])))  # two-sided test
 
 print("\nCalibration Table (Binomial Z-test):")
 print(cal_tbl[["bin", "n", "events", "DR", "PD", "Z", "p_value_norm"]])
 
 # Calibration plot: DR vs PD
 plt.figure(figsize=(8, 6))
-plt.plot(cal_tbl["PD"], cal_tbl["DR"], marker="o", linewidth=2, markersize=8, label="Observed DR")
-plt.plot([0, cal_tbl["PD"].max()], [0, cal_tbl["PD"].max()], "--", color="red", alpha=0.7, label="Perfect Calibration")
+plt.plot(cal_tbl["PD"], cal_tbl["DR"], marker="o",
+         linewidth=2, markersize=8, label="Observed DR")
+plt.plot([0, cal_tbl["PD"].max()], [0, cal_tbl["PD"].max()], "--",
+         color="red", alpha=0.7, label="Perfect Calibration")
 plt.xlabel("Average Predicted Probability (PD)")
 plt.ylabel("Observed Default Rate (DR)")
 plt.title("Model Calibration: Observed vs Predicted Default Rates")
@@ -160,7 +168,7 @@ df = sample.loc[sample["time"].isin([25, 26]), ["time", "LTV_time"]].dropna()
 
 # Define expected (time 25) and actual (time 26)
 expected = df.loc[df["time"] == 25, "LTV_time"]
-actual   = df.loc[df["time"] == 26, "LTV_time"]
+actual = df.loc[df["time"] == 26, "LTV_time"]
 
 # Define quantile bins based on expected distribution
 bins = np.quantile(expected, np.linspace(0, 1, 11))
@@ -180,7 +188,8 @@ act_pct = np.where(act_pct == 0, 1e-6, act_pct)
 
 # PSI calculation
 psi_value = np.sum((act_pct - exp_pct) * np.log(act_pct / exp_pct))
-print(f"Population Stability Index (PSI) for LTV_time (time 25 vs 26): {psi_value:.4f}")
+print(
+    f"Population Stability Index (PSI) for LTV_time (time 25 vs 26): {psi_value:.4f}")
 
 
 # Prepare table for plotting
@@ -195,12 +204,14 @@ psi_table["bin_label"] = psi_table.apply(
     lambda r: f"{r.bin_left:.1f}–{r.bin_right:.1f}", axis=1
 )
 
-print("\nPSI Table:" )
+print("\nPSI Table:")
 print(psi_table[["bin_label", "expected_pct", "actual_pct", "psi_contrib"]])
 # Histogram comparison
 plt.figure(figsize=(7, 4))
-plt.hist(expected, bins=bins, alpha=0.6, label="time 25", color="steelblue", density=True)
-plt.hist(actual, bins=bins, alpha=0.6, label="time 26", color="salmon", density=True)
+plt.hist(expected, bins=bins, alpha=0.6, label="time 25",
+         color="steelblue", density=True)
+plt.hist(actual, bins=bins, alpha=0.6,
+         label="time 26", color="salmon", density=True)
 plt.xlabel("LTV_time")
 plt.ylabel("Density")
 plt.title("Distribution of LTV_time (time 25 vs 26)")
@@ -208,13 +219,15 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
-# Quantile bar chart 
+# Quantile bar chart
 x = np.arange(len(psi_table))
 width = 0.35
 
 plt.figure(figsize=(8, 4))
-plt.bar(x - width/2, psi_table["expected_pct"], width, label="time 25", color="steelblue")
-plt.bar(x + width/2, psi_table["actual_pct"],   width, label="time 26", color="salmon")
+plt.bar(x - width/2, psi_table["expected_pct"],
+        width, label="time 25", color="steelblue")
+plt.bar(x + width/2, psi_table["actual_pct"],
+        width, label="time 26", color="salmon")
 plt.xticks(x, psi_table["bin_label"], rotation=45, ha="right")
 plt.ylabel("Proportion")
 plt.title("LTV_time – proportion in each decile (time 25 vs 26)")
@@ -222,13 +235,14 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
-# PSI contribution chart 
+# PSI contribution chart
 plt.figure(figsize=(8, 4))
 plt.bar(x, psi_table["psi_contrib"], color="darkorange")
 plt.xticks(x, psi_table["bin_label"], rotation=45, ha="right")
 plt.axhline(0, color="black", linewidth=0.8)
 plt.ylabel("PSI contribution")
-plt.title(f"PSI contributions by LTV_time decile (Total PSI = {psi_value:.4f})")
+plt.title(
+    f"PSI contributions by LTV_time decile (Total PSI = {psi_value:.4f})")
 plt.tight_layout()
 plt.show()
 
